@@ -1,0 +1,7 @@
+#footer{ float: left;  margin:5px; display: block; clear: both; }
+#sidebar-right{ float: left; }
+#content{ float: left; }
+
+#footer1 {float:left;}
+#footer2 {float:left;}
+body {background-color:rgba(0,255,0,0.3);}}

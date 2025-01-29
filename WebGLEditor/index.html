@@ -1,0 +1,736 @@
+<!DOCTYPE html>
+<!--
+To change this license header, choose License Headers in Project Properties.
+To change this template file, choose Tools | Templates
+and open the template in the editor.
+-->
+<html>
+    <head>
+        <title>WebGL Scene Editor</title>
+        <link rel="stylesheet" type="text/css" href="style.css" />
+        <script type="text/javascript" src="js/libs/glMatrix.js"></script>
+        <script type="text/javascript" src="js/libs/webgl-debug.js"></script>
+        <script type="text/javascript" src="js/libs/Entities.js"></script>
+        <script src="js/libs/cuon-utils.js"></script>
+        <script src="js/libs/cuon-matrix.js"></script>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+        <script id="shader-vs" type="x-shader/x-vertex">
+            attribute vec3 aVertexPosition;
+            uniform float u_ZValue;
+            uniform bool isColorMode;
+            attribute vec4 a_Color;
+            uniform mat4 uMVMatrix;
+            uniform vec2 u_resolution;
+            varying vec4 v_Color;
+            attribute vec2 a_TexCoord;
+            varying vec2 v_TexCoord;
+
+            attribute vec4 a_Normal;
+            uniform mat4 u_NormalMatrix;
+            varying vec3 v_Normal;
+            varying vec3 v_Position;
+            attribute vec3 a_LightPosition;
+            varying vec3 v_LightPosition;
+
+            void main() {
+            vec3 res = vec3(u_resolution[0],u_resolution[1],u_ZValue);
+            vec3 zeroToOne = aVertexPosition / res;
+            vec3 zeroToTwo = zeroToOne * 2.0;
+            vec3 clipSpace = zeroToTwo - 1.0;
+            gl_Position = uMVMatrix * vec4(clipSpace* vec3(1, 1,-1), 1);
+
+            v_LightPosition = a_LightPosition;
+            v_Position = vec3(gl_Position);
+            v_Normal = normalize(vec3(u_NormalMatrix * a_Normal));
+            if (isColorMode == true) 
+            {
+            v_Color = a_Color;
+            } 
+            else 
+            {
+            v_Color = a_Color;
+            v_TexCoord = a_TexCoord;			
+            }
+            }                
+        </script>
+
+        <script src="js/libs/webgl-debug.js"></script>
+        <script id="shader-fs" type="x-shader/x-fragment">
+            precision mediump float;
+            varying vec4 v_Color;
+            varying  vec2 v_TexCoord;
+            uniform sampler2D u_Sampler;
+            uniform bool  v_isColorMode;
+            uniform vec3 u_LightColor;     // Light color
+            varying vec3 v_LightPosition;  // Position of the light source
+            uniform vec3 u_AmbientLight;   // Ambient light color
+            varying vec3 v_Normal;
+            varying vec3 v_Position;
+            uniform bool v_lightson;
+
+            void main() {
+            // Normalize the normal because it is interpolated and not 1.0 in length any more
+            vec3 normal = normalize(v_Normal);
+            // Calculate the light direction and make its length 1.
+            vec3 lightDirection = normalize(v_LightPosition - v_Position);  
+            // The dot product of the light direction and the orientation of a surface (the normal)
+            float nDotL = max(dot(lightDirection, normal), 0.0);
+            // Calculate the final color from diffuse reflection and ambient reflection
+            vec3 diffuse = u_LightColor * v_Color.rgb * nDotL;
+            vec3 ambient = u_AmbientLight * v_Color.rgb;
+
+            if (v_isColorMode == true) 
+            {
+            if (v_lightson == true) 
+            {
+            gl_FragColor = vec4(diffuse + ambient, v_Color.a);
+            } 
+            else 
+            {
+            gl_FragColor =  v_Color;
+            } 
+            }
+            else if (v_lightson == false) 
+            {
+            gl_FragColor = texture2D(u_Sampler, v_TexCoord);
+            } 
+            else
+            {
+            diffuse = u_LightColor * nDotL;
+            ambient = u_AmbientLight;
+            vec4 texelColor = texture2D(u_Sampler, v_TexCoord);
+            gl_FragColor = vec4((diffuse + ambient)* texelColor.rgb, texelColor.a);
+            }
+            }
+
+        </script>
+
+        <script src="js/libs/Utils.js"></script>
+        <script type="text/javascript">
+var gl;
+var canvas;
+var shaderProgram;
+var g_MvpMatrix = new Matrix4();
+var myReq;
+var pointOfView;
+var viewAngle;
+var scene;
+var modelViewMatrixStack;
+var u_NormalMatrix;
+var u_LightColor;
+var u_LightPosition;
+var u_AmbientLight;
+var defaultView = [3.0, 3.0, 7.0,
+    0.0, 0.0, 0.0,
+    0.0, 1.0, 0.0];
+var frontView = [0.0, 0.0, 10.0,
+    0.0, 0.0, 0.0,
+    0.0, 1.0, 0.0];
+var rightView = [10.0, 0.0, 4.0,
+    0.0, 0.0, 0.0,
+    0.0, 1.0, 0.0];
+var leftView = [-10.0, 0.0, 4.0,
+    0.0, 0.0, 0.0,
+    0.0, 1.0, 0.0];
+var topView = [0.0, 8.0, 5.0,
+    0.0, 0.0, 0.0,
+    0.0, 1.0, 0.0];
+var bottomView = [0.0, -8.0, 5.0,
+    0.0, 0.0, 0.0,
+    0.0, 1.0, 0.0];
+var backView = [0.0, 0.0, -10.0,
+    0.0, 0.0, 0.0,
+    0.0, 1.0, 0.0];
+var currentView;
+var lightColor;
+var ambientColor;
+
+function initArrayBuffer(gl, data, num, type, attribute, stride, buffer) {
+    gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+    gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW);
+    var a_attribute = gl.getAttribLocation(shaderProgram, attribute);
+    gl.vertexAttribPointer(a_attribute, num, type, false, stride, 0);
+    gl.enableVertexAttribArray(a_attribute);
+}
+
+function SchemaFactory(shapeType, currentInstance) {
+    var schema;
+    if (currentInstance !== null) {
+        schema = currentInstance;
+    }
+    if (shapeType === shapes.BOX) {
+        var boxx = parseFloat(document.getElementById("boxx").value);
+        var boxy = parseFloat(document.getElementById("boxy").value);
+        var boxz = parseFloat(document.getElementById("boxz").value);
+        var boxxwidth = parseFloat(document.getElementById("boxxwidth").value);
+        var boxywidth = parseFloat(document.getElementById("boxywidth").value);
+        var boxzwidth = parseFloat(document.getElementById("boxzwidth").value);
+        if (currentInstance === null) {
+            schema = new Box(boxxwidth, boxywidth, boxzwidth, boxx, boxy, boxz);
+        } else {
+            schema.setPosition(boxxwidth, boxywidth, boxzwidth, boxx, boxy, boxz);
+        }
+    }
+    else if (shapeType === shapes.TRIANGLE) {
+        var trianglex = parseFloat(document.getElementById("trianglex").value);
+        var triangley = parseFloat(document.getElementById("triangley").value);
+        var trianglez = parseFloat(document.getElementById("trianglez").value);
+        var trianglexwidth = parseFloat(document.getElementById("trianglexwidth").value);
+        var triangleywidth = parseFloat(document.getElementById("triangleywidth").value);
+        var trianglezwidth = parseFloat(document.getElementById("trianglezwidth").value);
+        if (currentInstance === null) {
+            schema = new Triangle(trianglexwidth, triangleywidth, trianglezwidth, trianglex, triangley, trianglez);
+        } else {
+            schema.setPosition(trianglexwidth, triangleywidth, trianglezwidth, trianglex, triangley, trianglez);
+        }
+    } else
+    if (shapeType === shapes.SPHERE) {
+        var radius = parseFloat(document.getElementById("sphereradius").value);
+        var spherex = parseFloat(document.getElementById("spherex").value);
+        var spherey = parseFloat(document.getElementById("spherey").value);
+        var spherez = parseFloat(document.getElementById("spherez").value);
+        if (currentInstance === null) {
+            schema = new Sphere(radius, spherex, spherey, spherez);
+        } else {
+            schema.setPosition(radius, spherex, spherey, spherez);
+        }
+    } else
+    if (shapeType === shapes.CONE) {
+        var coneRadius = parseFloat(document.getElementById("coneradius").value);
+        var coneHeight = parseFloat(document.getElementById("coneheight").value);
+        var conex = parseFloat(document.getElementById("conex").value);
+        var coney = parseFloat(document.getElementById("coney").value);
+        var conez = parseFloat(document.getElementById("conez").value);
+        if (currentInstance === null) {
+            schema = new Cone(coneRadius, coneHeight, conex, coney, conez);
+        } else {
+            schema.setPosition(coneRadius, coneHeight, conex, coney, conez);
+        }
+    } else
+    if (shapeType === shapes.CYLINDER) {
+        var cylinderRadius = parseFloat(document.getElementById("cylinderradius").value);
+        var cylinderHeight = parseFloat(document.getElementById("cylinderheight").value);
+        var cylinderx = parseFloat(document.getElementById("cylinderx").value);
+        var cylindery = parseFloat(document.getElementById("cylindery").value);
+        var cylinderz = parseFloat(document.getElementById("cylinderz").value);
+        if (currentInstance === null) {
+            schema = new Cylinder(cylinderRadius, cylinderHeight, cylinderx, cylindery, cylinderz);
+        } else {
+            schema.setPosition(cylinderRadius, cylinderHeight, cylinderx, cylindery, cylinderz);
+        }
+    }
+    return schema;
+}
+
+
+function InitShape(currentShape, currentInstance, modification) {
+    var currentColor;
+    var isColor;
+    var schema = SchemaFactory(currentShape, currentInstance);
+
+    if (modification === modify.NEW || modification === modify.COLOR) {
+        isColor = true;
+        currentColor = getColor();
+        schema.isColorMode = isColor;
+        schema.setColor(currentColor[0], currentColor[1], currentColor[2]);
+    }
+    isColor = schema.isColorMode;
+
+    initArrayBuffer(gl, schema.getVertices(), 3, gl.FLOAT, "aVertexPosition", 0, schema.getPositionBuffer());
+    if (isColor) {
+        initArrayBuffer(gl, schema.getColors(), 3, gl.FLOAT, "a_Color", 0, schema.getColorBuffer());
+    } else {
+        initArrayBuffer(gl, schema.getTexture(), 2, gl.FLOAT, "a_TexCoord", 0, schema.getTextureBuffer());
+    }
+
+    var isColorMode = gl.getUniformLocation(shaderProgram, "isColorMode");
+    gl.uniform1i(isColorMode, isColor);
+    var v_isColorMode = gl.getUniformLocation(shaderProgram, "v_isColorMode");
+    gl.uniform1i(v_isColorMode, isColor);
+    initArrayBuffer(gl, schema.getNormals(), 3, gl.FLOAT, "a_Normal", 0, schema.getNormalsBuffer());
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, schema.getIndexBuffer());
+    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, schema.getIndices(), gl.STATIC_DRAW);
+    return schema;
+}
+
+function draw(viewProjMatrix, u_MvpMatrix, currentAngle) {
+// Calculate The model view projection matrix and pass it to u_MvpMatrix
+    g_MvpMatrix.set(viewProjMatrix);
+    g_MvpMatrix.rotate(currentAngle[0], 1.0, 0.0, 0.0); // Rotation around x-axis
+    g_MvpMatrix.rotate(currentAngle[1], 0.0, 1.0, 0.0); // Rotation around y-axis
+
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+    if (scene !== null) {
+        for (var schemaName in scene) {
+            var currentSchema = scene[schemaName];
+            pushModelViewMatrix();
+            gl.uniformMatrix4fv(u_MvpMatrix, false, g_MvpMatrix.elements);
+            var isColorMode = gl.getUniformLocation(shaderProgram, "isColorMode");
+            gl.uniform1i(isColorMode, currentSchema.isColorMode);
+            var v_isColorMode = gl.getUniformLocation(shaderProgram, "v_isColorMode");
+            gl.uniform1i(v_isColorMode, currentSchema.isColorMode);
+            if (currentSchema.isColorMode) {
+                gl.bindBuffer(gl.ARRAY_BUFFER, currentSchema.getColorBuffer());
+                gl.bufferData(gl.ARRAY_BUFFER, currentSchema.getColors(), gl.STATIC_DRAW);
+                var a_color = gl.getAttribLocation(shaderProgram, "a_Color");
+                gl.vertexAttribPointer(a_color, 3, gl.FLOAT, false, 0, 0);
+                gl.enableVertexAttribArray(a_color);
+            } else {
+                gl.bindBuffer(gl.ARRAY_BUFFER, currentSchema.getTextureBuffer());
+                gl.bufferData(gl.ARRAY_BUFFER, currentSchema.getTexture(), gl.STATIC_DRAW);
+                var a_TexCoord = gl.getAttribLocation(shaderProgram, "a_TexCoord");
+                gl.vertexAttribPointer(a_TexCoord, 2, gl.FLOAT, false, 0, 0);
+                gl.enableVertexAttribArray(a_TexCoord);
+                gl.activeTexture(gl.TEXTURE0);
+                gl.bindTexture(gl.TEXTURE_2D, currentSchema.getTextureData());
+            }
+
+            gl.bindBuffer(gl.ARRAY_BUFFER, currentSchema.getNormalsBuffer());
+            gl.bufferData(gl.ARRAY_BUFFER, currentSchema.getNormals(), gl.STATIC_DRAW);
+            var a_Normal = gl.getAttribLocation(shaderProgram, "a_Normal");
+            gl.vertexAttribPointer(a_Normal, 3, gl.FLOAT, false, 0, 0);
+            gl.enableVertexAttribArray(a_Normal);
+            gl.bindBuffer(gl.ARRAY_BUFFER, currentSchema.getPositionBuffer());
+            gl.bufferData(gl.ARRAY_BUFFER, currentSchema.getVertices(), gl.STATIC_DRAW);
+            var aVertexPosition = gl.getAttribLocation(shaderProgram, "aVertexPosition");
+            gl.vertexAttribPointer(aVertexPosition, 3, gl.FLOAT, false, 0, 0);
+            gl.enableVertexAttribArray(aVertexPosition);
+            gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, currentSchema.getIndexBuffer());
+            gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, currentSchema.getIndices(), gl.STATIC_DRAW);
+            refreshLight();
+            gl.drawElements(gl.TRIANGLES, currentSchema.getIndicesLength(), gl.UNSIGNED_SHORT, 0);
+            popModelViewMatrix();
+        }
+    }
+}
+
+function main()
+{
+    modelViewMatrixStack = [];
+    canvas = document.getElementById("myGLCanvas");
+    gl = WebGLDebugUtils.makeDebugContext(createGLContext(canvas));
+    pointOfView = view.DEFAULT;
+    viewAngle = 30.0;
+    setupShaders();
+    initLight();
+    startup(false, true);
+    showhideShapes(shapes.BOX);
+}
+
+function initLight() {
+    lightColor = getLightColor();
+    ambientColor = getAmbientColor();
+    lightPosition = getLightPosition();
+    gl.vertexAttrib3f(u_LightPosition, lightPosition[0], lightPosition[1], lightPosition[2]);
+    gl.uniform3f(u_LightColor, lightColor[0], lightColor[1], lightColor[2]);
+    gl.uniform3f(u_AmbientLight, ambientColor[0], ambientColor[1], ambientColor[2]);
+    var normalMatrix = new Matrix4(); // Transformation matrix for normals
+    normalMatrix.setInverseOf(g_MvpMatrix);
+    normalMatrix.transpose();
+    gl.uniformMatrix4fv(u_NormalMatrix, false, normalMatrix.elements);
+    var v_lightson = gl.getUniformLocation(shaderProgram, "v_lightson");
+    var lightson = document.getElementById("lightswitch").checked;
+    gl.uniform1i(v_lightson, lightson);
+}
+
+function refreshLight() {
+    var normalMatrix = new Matrix4(); // Transformation matrix for normals
+    // Calculate the matrix to transform the normal based on the model matrix
+    normalMatrix.setInverseOf(g_MvpMatrix);
+    normalMatrix.transpose();
+    // Pass the transformation matrix for normals to u_NormalMatrix
+    gl.uniformMatrix4fv(u_NormalMatrix, false, normalMatrix.elements);
+}
+
+function setViewPoint() {
+    var viewPointSelectedValue = document.getElementById("viewpoint").value;
+    pointOfView = parseInt(viewPointSelectedValue);
+}
+
+function setCameraPosition() {
+    var camerax = parseFloat(document.getElementById("camerax").value);
+    var cameray = parseFloat(document.getElementById("cameray").value);
+    var cameraz = parseFloat(document.getElementById("cameraz").value);
+    currentView = [camerax, cameray, cameraz, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0];
+    viewAngle = parseFloat(document.getElementById("viewangle").value);
+}
+
+
+function startup(isCameraChange, changeView) {
+    if (!isCameraChange) {
+        setViewPoint();
+    } else {
+        setCameraPosition();
+    }
+    gl.clearColor(0.0, 0.0, 0.0, 1.0);
+    gl.enable(gl.DEPTH_TEST);
+    var u_MvpMatrix = gl.getUniformLocation(shaderProgram, 'uMVMatrix');
+    var viewProjMatrix = new Matrix4();
+    viewProjMatrix.setPerspective(viewAngle, canvas.width / canvas.height, 1.0, 500.0);
+    if (changeView) {
+        switch (pointOfView) {
+            case view.DEFAULT:
+                currentView = defaultView;
+                break;
+            case view.FRONT:
+                currentView = frontView;
+                break;
+            case view.BACK:
+                currentView = backView;
+                break;
+            case view.TOP:
+                currentView = topView;
+                break;
+            case view.BOTTOM:
+                currentView = bottomView;
+                break;
+            case view.LEFT:
+                currentView = leftView;
+                break;
+            case view.RIGHT:
+                currentView = rightView;
+                break;
+        }
+    }
+    viewProjMatrix.lookAt(currentView[0], currentView[1], currentView[2],
+            currentView[3], currentView[4], currentView[5],
+            currentView[6], currentView[7], currentView[8]);
+    // Register the event handler
+    var currentAngle = [0.0, 0.0]; // Current rotation angle ([x-axis, y-axis] degrees)
+    initEventHandlers(canvas, currentAngle);
+    var tick = function() {   // Start drawing
+        draw(viewProjMatrix, u_MvpMatrix, currentAngle);
+        myReq = requestAnimationFrame(tick, canvas);
+    };
+    tick();
+}
+
+
+function showhideShapes(shape)
+{
+    document.getElementById("boxset").disabled = (shape !== shapes.BOX);
+    document.getElementById("coneset").disabled = (shape !== shapes.CONE);
+    document.getElementById("cylinderset").disabled = (shape !== shapes.CYLINDER);
+    document.getElementById("sphereset").disabled = (shape !== shapes.SPHERE);
+    document.getElementById("triangleset").disabled = (shape !== shapes.TRIANGLE);
+}
+
+function changeViewPoint()
+{
+    startup(false, true);
+}
+
+function changeCamera() {
+    pointOfView = view.CUSTOM;
+    startup(true, true);
+}
+
+function modifyShape(modification)
+{
+    var currentShape = getShapeFromListBox();
+    var sceneSelect = document.getElementById("scene");
+    if (sceneSelect.selectedIndex < 0)
+        return;
+    var shapeName = sceneSelect.options[sceneSelect.selectedIndex].value;
+    scene[shapeName] = InitShape(currentShape, scene[shapeName], modification);
+}
+
+function deleteFromScene() {
+    var sceneSelect = document.getElementById("scene");
+    if (sceneSelect.selectedIndex < 0)
+        return;
+    var shapeName = sceneSelect.options[sceneSelect.selectedIndex].value;
+    delete scene[shapeName];
+    sceneSelect.remove(sceneSelect.selectedIndex);
+}
+
+function addToScene() {
+    var name;
+    var currentShape = getShapeFromRadioButtons();
+    var schema = InitShape(currentShape, null, modify.NEW);
+    switch (currentShape) {
+        case  shapes.BOX:
+            name = "Box";
+            break;
+        case shapes.CONE:
+            name = "Cone";
+            break;
+        case shapes.CYLINDER:
+            name = "Cylinder";
+            break;
+        case shapes.SPHERE:
+            name = "Sphere";
+            break;
+        case shapes.TRIANGLE:
+            name = "Pyramid";
+            break;
+    }
+    if (scene == null) {
+        scene = new Array();
+    }
+    var exists = true;
+    var i = 1;
+    var keys = Object.keys(scene);
+    var tempName = name;
+    while (exists) {
+        exists = (keys.indexOf(tempName) > -1);
+        if (!exists) {
+            name = tempName;
+            break;
+        }
+        tempName = name + "_" + i.toString();
+        i++;
+    }
+    var schemaSelect = document.getElementById("scene");
+    var selectBoxOption = document.createElement("option");
+    selectBoxOption.value = name;
+    selectBoxOption.text = name;
+    schemaSelect.add(selectBoxOption, null);
+    schemaSelect.selectedIndex = schemaSelect.length - 1;
+    scene[name] = schema;
+}
+
+function getShapeFromRadioButtons() {
+    if (document.getElementById("box").checked)
+        return shapes.BOX;
+    if (document.getElementById("cone").checked)
+        return shapes.CONE;
+    if (document.getElementById("cylinder").checked)
+        return shapes.CYLINDER;
+    if (document.getElementById("sphere").checked)
+        return shapes.SPHERE;
+    if (document.getElementById("triangle").checked)
+        return shapes.TRIANGLE;
+}
+
+function getShapeFromListBox() {
+    var sceneSelect = document.getElementById("scene");
+    var shapeName = sceneSelect.options[sceneSelect.selectedIndex].value;
+    if (sceneSelect.selectedIndex < 0) {
+        return null;
+    }
+    if (scene[shapeName] instanceof Box) {
+        return shapes.BOX;
+    } else if (scene[shapeName] instanceof Triangle) {
+        return shapes.TRIANGLE;
+    } else if (scene[shapeName] instanceof Sphere) {
+        return shapes.SPHERE;
+    } else if (scene[shapeName] instanceof Cone) {
+        return shapes.CONE;
+    } else if (scene[shapeName] instanceof Cylinder) {
+        return shapes.CYLINDER;
+    }
+}
+
+function changeTexture() {
+    var sceneSelect = document.getElementById("scene");
+    var shapeName = sceneSelect.options[sceneSelect.selectedIndex].value;
+    if (sceneSelect.selectedIndex < 0) {
+        return null;
+    }
+    getTexture(scene[shapeName]);
+    InitShape(scene[shapeName].getClass(), scene[shapeName], modify.TEXTRURE);
+}
+
+
+function selectedSchemaChanged() {
+    var currentShape = getShapeFromListBox();
+    if (currentShape == null) {
+        return;
+    }
+    var sceneSelect = document.getElementById("scene");
+    if (sceneSelect.selectedIndex < 0) {
+        return;
+    }
+    showhideShapes(currentShape);
+    var shapeName = sceneSelect.options[sceneSelect.selectedIndex].value;
+    var colorR = scene[shapeName].rColor;
+    var colorG = scene[shapeName].gColor;
+    var colorB = scene[shapeName].bColor;
+    setColorPicker(colorR, colorG, colorB);
+    if (currentShape === shapes.BOX) {
+        document.getElementById("boxx").value = scene[shapeName].xPos;
+        document.getElementById("boxy").value = scene[shapeName].yPos;
+        document.getElementById("boxz").value = scene[shapeName].zPos;
+        document.getElementById("boxxwidth").value = scene[shapeName].xWidth;
+        document.getElementById("boxywidth").value = scene[shapeName].yWidth;
+        document.getElementById("boxzwidth").value = scene[shapeName].zWidth;
+    } else if (currentShape === shapes.TRIANGLE) {
+        document.getElementById("trianglex").value = scene[shapeName].xPos;
+        document.getElementById("triangley").value = scene[shapeName].yPos;
+        document.getElementById("trianglez").value = scene[shapeName].zPos;
+        document.getElementById("trianglexwidth").value = scene[shapeName].xWidth;
+        document.getElementById("triangleywidth").value = scene[shapeName].yWidth;
+        document.getElementById("trianglezwidth").value = scene[shapeName].zWidth;
+    } else if (currentShape === shapes.SPHERE) {
+        document.getElementById("sphereradius").value = scene[shapeName].radius;
+        document.getElementById("spherex").value = scene[shapeName].xPos;
+        document.getElementById("spherey").value = scene[shapeName].yPos;
+        document.getElementById("spherez").value = scene[shapeName].zPos;
+    } else if (currentShape === shapes.CONE) {
+        document.getElementById("coneheight").value = scene[shapeName].height;
+        document.getElementById("coneradius").value = scene[shapeName].radius1;
+        document.getElementById("conex").value = scene[shapeName].xPos;
+        document.getElementById("coney").value = scene[shapeName].yPos;
+        document.getElementById("conez").value = scene[shapeName].zPos;
+    } else if (currentShape === shapes.CYLINDER) {
+        document.getElementById("cylinderheight").value = scene[shapeName].height;
+        document.getElementById("cylinderradius").value = scene[shapeName].radius;
+        document.getElementById("cylinderx").value = scene[shapeName].xPos;
+        document.getElementById("cylindery").value = scene[shapeName].yPos;
+        document.getElementById("cylinderz").value = scene[shapeName].zPos;
+    }
+}
+
+
+window.onload = function() {
+    document.getElementById("box").onclick = function() {
+        showhideShapes(shapes.BOX);
+    };
+    document.getElementById("cone").onclick = function() {
+        showhideShapes(shapes.CONE);
+    };
+    document.getElementById("cylinder").onclick = function() {
+        showhideShapes(shapes.CYLINDER);
+    };
+    document.getElementById("sphere").onclick = function() {
+        showhideShapes(shapes.SPHERE);
+    };
+    document.getElementById("triangle").onclick = function() {
+        showhideShapes(shapes.TRIANGLE);
+    };
+    document.getElementById('fileInput').addEventListener('change', changeTexture, false);
+}
+        </script>
+    </head>
+
+    <body onload="main();">
+        <div id="wrapper">
+            <div id="content">  
+                <canvas id="myGLCanvas" style="border:1px solid #000000;" width="800" height="800">
+                    Please use a browser that supports "canvas"
+                </canvas>
+            </div>
+            <div id="sidebar-right"> 
+                <fieldset class="boxR">
+                    <legend>Scene Contents</legend>
+                    <select id="scene" name="scene" onchange="selectedSchemaChanged();">
+                    </select>
+                    <input type="button" id ="deletefromscene" value="Delete from scene" onclick="deleteFromScene();">
+                </fieldset>
+                <fieldset class="boxR">
+                    <legend>Color</legend>
+                    <input type="color" id ="colorpicker" name="color" onchange="modifyShape(modify.COLOR);" value="#0000FF">
+                </fieldset>
+                <fieldset class="boxR">
+                    <legend>Texture</legend>
+                    <input type="file" id="fileInput" onchange="changeTexture();" >
+                </fieldset>
+
+                <fieldset class="boxR">
+                    <legend>Viewpoint</legend>
+                    <select id="viewpoint" name="ViewPoint" onchange="changeViewPoint();">
+                        <option value="6">Default</option>
+                        <option value="0">Top</option>
+                        <option value="1">Bottom</option>
+                        <option value="2">Left</option>
+                        <option value="3">Right</option>
+                        <option value="4">Front</option>
+                        <option value="5">Back</option>
+                    </select>
+                </fieldset>
+                <fieldset id="camera" class="boxR">
+                    <legend>Camera</legend>
+                    x:<input id = "camerax" type="range" name="camerax" min="-20.0" max="20.0" value="3.0" step="0.5" onchange="changeCamera();"><br>
+                    y:<input id = "cameray" type="range" name="cameray" min="-20.0" max="20.0" value="3.0" step="0.5" onchange="changeCamera();"><br>
+                    z:<input id = "cameraz" type="range" name="cameraz" min="-20.0" max="20.0" value="7.0" step="0.5" onchange="changeCamera();"><br>  
+                    Zoom (view angle)<input id = "viewangle" type="number" name="viewangle" min="0.0" max="180.0" value="30.0" step="0.5" onchange="changeCamera();"><br>  
+                </fieldset>
+
+                <fieldset id="light" class="boxR">
+                    <legend>Light</legend>
+                    On/Off<input type="checkbox" id="lightswitch" name="lightswitch" checked onchange="initLight();"><br>
+                    x:<input id = "lightx" type="range" name="lightx" min="-20.0"  max="20" value="2.5" step="0.5" onchange="initLight();"><br>
+                    y:<input id = "lighty" type="range" name="lighty" min="-20.0"  max="20" value="4.0" step="0.5" onchange="initLight();"><br>
+                    z:<input id = "lightz" type="range" name="lightz" min="-20.0"  max="20" value="3.5" step="0.5" onchange="initLight();"><br>  
+                </fieldset>
+
+                <fieldset class="boxR">
+                    <legend>Light Color</legend>
+                    <input type="color" id ="lightcolorpicker" name="lightcolor" onchange="initLight();" value="#FFFFFF">
+                </fieldset>
+                <fieldset class="boxR">
+                    <legend>Ambient Color</legend>
+                    <input type="color" id ="ambientcolorpicker" name="ambientcolor" onchange="initLight();" value="#333333">
+                </fieldset>
+
+            </div>
+            <div id="footer">
+                <div id="footer1">
+                    <fieldset class="box"> 
+                        <legend>Shapes</legend>
+                        <input id = "box" type="radio" name="BShapes" value="Box" checked="checked">Box<br>
+                        <input id= "cone" type="radio" name="BShapes" value="Cone">Cone<br>
+                        <input id = "cylinder" type="radio" name="BShapes" value="Cylinder">Cylinder<br>
+                        <input id = "sphere" type="radio" name="BShapes" value="Sphere">Sphere<br>
+                        <input id = "triangle" type="radio" name="BShapes" value="Pyramid">Pyramid<br>
+                        <input type="button" id ="addtoscene" value="Add to scene" onclick="addToScene();">
+                    </fieldset> 
+                </div>
+                <div id="footer2">
+                    <fieldset id="boxset" class="box">
+                        <legend>Box</legend>
+                        x:<input type="range" id = "boxx" name="boxx" min="0" max="800" value="400.0" onchange="modifyShape(modify.SIZE);"><br>
+                        y:<input type="range" id = "boxy" name="boxy" min="0" max="800" value="400.0" onchange="modifyShape(modify.SIZE);"><br>
+                        z:<input type="range" id = "boxz" name="boxz" min="0" max="800" value="400.0" onchange="modifyShape(modify.SIZE);"><br>
+                        x-Width:<input id = "boxxwidth" type="range" name="boxxwidth" min="0" max="800" value="450.0" onchange="modifyShape(modify.SIZE);"><br>
+                        y-Width:<input id = "boxywidth" type="range" name="boxywidth" min="0" max="800" value="450.0" onchange="modifyShape(modify.SIZE);"><br>
+                        z-Width:<input id = "boxzwidth" type="range" name="boxzwidth" min="0" max="800" value="450.0" onchange="modifyShape(modify.SIZE);"><br>  
+                    </fieldset>
+                </div>    
+                <div id="footer3" >
+                    <fieldset id="coneset" class="box">
+                        <legend>Cone</legend>
+                        x:<input type="range" id = "conex" name="conex" min="0" max="800" value="400.0" onchange="modifyShape(modify.SIZE);"><br>
+                        y:<input type="range" id = "coney" name="coney" min="0" max="800" value="400.0" onchange="modifyShape(modify.SIZE);"><br>
+                        z:<input type="range" id = "conez" name="conez" min="0" max="800" value="400.0" onchange="modifyShape(modify.SIZE);"><br>
+                        Bottom Radius:<input id = "coneradius" type="number" name="coneradius" min="0.0" max="800.0" value="200.0" step="40.0" onchange="modifyShape(modify.SIZE);"><br>
+                        Height:<input id = "coneheight" type="number" name="coneheight" min="0.0" max="800.0" value="400.0" step="40.0" onchange="modifyShape(modify.SIZE);"><br>
+                    </fieldset>
+                </div>    
+                <div id="footer4" >
+                    <fieldset id="cylinderset" class="box">
+                        <legend>Cylinder</legend>
+                        x:<input type="range" id = "cylinderx" name="cylinderx" min="0" max="800" value="400.0" onchange="modifyShape(modify.SIZE);"><br>
+                        y:<input type="range" id = "cylindery" name="cylindery" min="0" max="800" value="400.0" onchange="modifyShape(modify.SIZE);"><br>
+                        z:<input type="range" id = "cylinderz" name="cylinderz" min="0" max="800" value="400.0" onchange="modifyShape(modify.SIZE);"><br>
+                        Radius:<input id = "cylinderradius" type="number" name="cylinderradius" min="0.0" max="800.0" value="200.0" step="40.0" onchange="modifyShape(modify.SIZE);"><br>
+                        Height:<input id = "cylinderheight" type="number" name="cylinderheight" min="0.0" max="800.0" value="400.0" step="40.0" onchange="modifyShape(modify.SIZE);"><br>
+                    </fieldset>
+                </div>    
+                <div id="footer5" >
+                    <fieldset id = "sphereset" class="box">
+                        <legend>Sphere</legend>              
+                        x:<input id = "spherex" type="range" name="spherex" min="0" max="800" value="400.0" onchange="modifyShape(modify.SIZE);"><br>
+                        y:<input id = "spherey" type="range" name="spherey" min="0" max="800" value="400.0" onchange="modifyShape(modify.SIZE);"><br>
+                        z:<input id = "spherez" type="range" name="spherez" min="0" max="800" value="400.0" onchange="modifyShape(modify.SIZE);"><br>
+                        Radius:<input id = "sphereradius" type="number" name="sphereRadius" min="0" max="800" value="200.0" step="40.0" onchange="modifyShape(modify.SIZE);"><br>
+                    </fieldset>
+                </div>    
+                <div id="footer6" >
+                    <fieldset id="triangleset" class="box">
+                        <legend>Pyramid</legend>
+                        x:<input id = "trianglex" type="range" name="trianglex" min="0" max="800" value="400.0" onchange="modifyShape(modify.SIZE);"><br>
+                        y:<input id = "triangley" type="range" name="triangley" min="0" max="800" value="400.0" onchange="modifyShape(modify.SIZE);"><br>
+                        z:<input id = "trianglez" type="range" name="trianglez" min="0" max="800" value="400.0" onchange="modifyShape(modify.SIZE);"><br>
+                        x-Width:<input id = "trianglexwidth" type="range" name="trianglexwidth" min="0" max="800" value="550.0" onchange="modifyShape(modify.SIZE);"><br>
+                        y-Width:<input id = "triangleywidth" type="range" name="triangleywidth" min="0" max="800" value="550.0" onchange="modifyShape(modify.SIZE);"><br>
+                        z-Width:<input id = "trianglezwidth" type="range" name="trianglezwidth" min="0" max="800" value="550.0" onchange="modifyShape(modify.SIZE);"><br>  
+                    </fieldset>
+                </div>    
+            </div>
+        </div>
+    </body>
+</html>
